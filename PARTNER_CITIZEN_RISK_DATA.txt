@@ -1,0 +1,213 @@
+PayGam — Working with Gambian Partners for Citizen Risk Features
+================================================================
+Purpose: explain how PayGam will work with banks, utilities, telcos,
+government agencies, and other partners to supply real feature data for
+the Citizen Risk Assessment ML Module once live.
+
+Audience: product, engineering, partnerships, legal/compliance.
+Related code: app/services/citizen_risk_features.py
+Related endpoint: POST /internal/risk-score
+
+
+1. What we need from partners
+-----------------------------
+The ML engine does NOT ask partners for a finished "risk score".
+Partners send raw, auditable events / account status. PayGam turns those
+into the seven model features:
+
+  late_payments
+  overdue_services
+  service_requests_30d
+  distinct_locations_30d
+  compliance_flags
+  pin_failed_attempts          (mostly PayGam-owned)
+  phone_sim_swap_recent
+
+Every scored subject is identified only by an opaque subject_ref
+(PayGam / institutional customer reference). Do not send national ID,
+raw biometrics, or unnecessary PII into the ML feature store.
+
+
+2. Partner map (who supplies what)
+---------------------------------
+Partner type              Features supported              Typical refresh
+------------------------  ------------------------------  ---------------
+Banks / MFIs / lenders    late_payments                   hourly / daily
+NAWEC / utilities         overdue_services                daily
+Municipal / license       overdue_services                daily / weekly
+eGov service desks        service_requests_30d            near real-time
+Branch / agent networks   distinct_locations_30d          near real-time
+GRA / KYC / compliance    compliance_flags                daily / event
+Police / courts (lawful)  compliance_flags                event / batch
+Africell / QCell / Gamcel phone_sim_swap_recent           near real-time
+PayGam itself             pin_failed_attempts,            real-time
+                          wallet late_payments, location
+
+
+3. Legal and commercial steps before any data moves
+---------------------------------------------------
+1) Define lawful purpose: fraud prevention, credit/risk assessment,
+   compliance screening — not marketing reuse.
+2) Sign MoU + Data Processing / Sharing Agreement.
+3) Agree retention, deletion, audit rights, and incident notification.
+4) Agree field dictionary, enums, timezones (UTC), and currency (GMD).
+5) Agree SLA: freshness, uptime, replay support, support contacts.
+6) Complete security review: TLS, mutual auth / API keys, IP allowlists.
+7) Start in SHADOW mode: compute ML + rules, rules remain authoritative.
+
+
+4. Technical integration options
+--------------------------------
+Prefer one of these patterns per partner (in order):
+
+A) Near-real-time webhook
+   Partner POSTs signed events to PayGam:
+   POST /internal/partners/{partner_code}/events
+   Best for: SIM swap, service tickets, compliance alerts.
+
+B) Scheduled batch pull/push
+   Daily/hourly file or API extract (JSON/CSV) of arrears / statuses.
+   Best for: NAWEC bills, bank overdue portfolios, GRA flags.
+
+C) On-demand lookup at score time
+   PayGam calls partner API when scoring a subject.
+   Best for: fresh SIM-swap check; use sparingly (latency + cost).
+
+All partner traffic is service-to-service (internal auth), separate from
+end-user JWT login.
+
+
+5. Canonical event shape partners should send
+---------------------------------------------
+Minimal JSON event (example):
+
+{
+  "event_id": "evt_20260726_0001",
+  "partner_code": "BANK_XYZ",
+  "subject_ref": "pg_user_8f3a",
+  "event_type": "payment_overdue",
+  "occurred_at": "2026-07-26T10:15:00Z",
+  "payload": {
+    "days_past_due": 45,
+    "amount_gmd": 2500.00,
+    "product": "microloan"
+  }
+}
+
+Rules:
+- event_id must be unique so PayGam can deduplicate / replay safely.
+- subject_ref must already be linked through onboarding/KYC mapping.
+- occurred_at must be ISO-8601 UTC.
+- payload stays partner-specific; PayGam maps it into features.
+
+
+6. How PayGam turns partner data into features
+----------------------------------------------
+At score time (or via a periodic feature-builder job), PayGam aggregates
+partner events into CitizenRiskFeatures:
+
+  late_payments          = count of overdue loan/payment obligations
+  overdue_services       = count of unpaid utility/license obligations
+  service_requests_30d   = count of service tickets in last 30 days
+  distinct_locations_30d = distinct districts/agents/branches in 30 days
+  compliance_flags       = count of open/serious compliance incidents
+  pin_failed_attempts    = current failed PIN counter from PayGam auth
+  phone_sim_swap_recent  = true if telco reported swap within N days
+
+That snapshot is posted to:
+  POST /internal/risk-score
+
+The model uses app/services/citizen_risk_features.py::to_feature_vector()
+and stores an additive audit row (never overwrites existing credit-score
+systems).
+
+
+7. Org-type rollout with partners
+---------------------------------
+BANK
+  Priority feeds: banks/MFIs + telco SIM-swap + PayGam PIN/payments
+  First candidate for ML_ASSISTED after shadow proves out
+
+POLICE
+  Priority feeds: location behavior + compliance flags
+  Stay in SHADOW longer; require stricter lawful-basis review
+
+COURT
+  Priority feeds: compliance / enforcement related obligations
+  Stay in SHADOW longer; require stricter lawful-basis review
+
+Default rollout mode at go-live: SHADOW for all org types.
+
+
+8. Operating model once live
+----------------------------
+Daily:
+- monitor partner feed freshness and error rates
+- alert if SIM-swap or arrears feeds go stale beyond SLA
+- review fallback logs (ML unavailable / low confidence)
+
+Weekly:
+- compare ML vs rule scores side by side (shadow report)
+- spot-check top_reasons with case officers
+- reconcile unmatched subject_ref mapping failures
+
+Monthly:
+- retrain/evaluate with newly labeled outcomes (default, block, case)
+- fairness / segment review by org type and region where lawful
+- partner QBR: volume, quality, incidents, contract changes
+
+
+9. Responsibilities
+-------------------
+PayGam
+- provide subject_ref mapping process and sandbox
+- run ingestion, feature builder, scoring, audit trail
+- keep rules fallback and SHADOW controls
+- report quality issues back to partner
+
+Partner
+- send agreed events/files on SLA
+- keep subject mapping accurate
+- notify PayGam of schema changes before deploy
+- support replay for missed windows
+
+Legal / Compliance
+- MoUs, DPA, retention, deletion, breach process
+- approve POLICE/COURT data uses before production scoring
+
+
+10. Go-live checklist
+---------------------
+[ ] MoU + DPA signed for each partner
+[ ] Sandbox credentials and sample files validated
+[ ] subject_ref linkage tested (no NIN in ML store)
+[ ] Ingestion endpoint + dedupe + replay tested
+[ ] Feature builder maps all 7 fields correctly
+[ ] Shadow scoring enabled; rules still authoritative
+[ ] Monitoring/alerts for stale or failed feeds
+[ ] Runbook for partner outage (auto fallback to rules /
+    available PayGam-owned features only)
+[ ] Case-officer explanation review passed
+[ ] Approval gate before any org type moves to ML_ASSISTED
+
+
+11. What success looks like
+---------------------------
+- Partners send reliable events, not opinions.
+- PayGam always has a fresh feature snapshot per subject_ref.
+- /internal/risk-score returns risk_score, risk_level, org_type,
+  top_reasons, model_version, decision_source every time.
+- If a partner feed fails, scoring still works via rule fallback.
+- No existing CitizenCreditScore / rule system data is overwritten.
+
+
+12. Immediate next actions
+--------------------------
+1) Pick first pilot partners: one bank/MFI + one telco (+ PayGam internal).
+2) Finalize field dictionary for late_payments and phone_sim_swap_recent.
+3) Implement partner event ingestion API + feature builder.
+4) Run SHADOW for BANK until metrics beat the rule baseline.
+5) Only then expand to utilities / GRA / justice partners.
+
+Contact: PayGam partnerships + egov-ml-engine owners.
+Status: planning document for live partner operations.

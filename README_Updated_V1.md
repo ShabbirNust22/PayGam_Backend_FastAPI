@@ -72,84 +72,74 @@ paygam_backend/
                 └── risk_insights.py
 ```
 
-## Run it
+## Run it (Windows)
 
-```bash
-python -m venv venv && source venv/bin/activate
+```powershell
+python -m venv venv
+.\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 uvicorn main:app --reload
 ```
 
 Swagger UI: **http://127.0.0.1:8000/docs**
 (SQLite database `paygam.db` is created automatically on first run — swap
-`DATABASE_URL` in `app/core/config.py` for Postgres/MySQL in production.)
+`DATABASE_URL` in `app/core/config.py` or `.env` for Postgres/MySQL in production.)
 
-## The payment flow (TapSign + risk scoring)
-
-`POST /api/v1/payments/send` is the core of the integration:
-
-1. **TapSign verification** — the request carries a `feature_vector`
-   (produced by the on-device/CNN fingerprint feature extractor — the raw
-   fingerprint image is never sent to or stored by this backend) plus a
-   `liveness_score`. The backend:
-   - rejects if liveness fails (anti-spoofing gate)
-   - compares the vector against the user's **encrypted** enrolled template
-     using cosine similarity (`app/services/tapsign_service.py`)
-2. **Risk scoring** — amount, transaction velocity, and new-payee checks
-   produce a 0–1 risk score (`app/services/risk_service.py`), which decides:
-   `authorized` → funds move immediately · `requires_review` → transaction
-   is recorded but held · `blocked` → rejected outright.
-3. Funds move only after both gates pass, and every attempt (success or
-   failure) is recorded in the `transactions` table for audit.
-
-## Member authentication — fingerprint, face, PIN, phone, and a real challenge-response protocol
-
-`main.py` now hosts the top-level member-authentication orchestration
-(`match_customer_fingerprint`, `test_fingerprint_protocol`,
-`handle_challenge_protocol`, `evaluate_member_authentication`), which the
-routers below call into:
-
-| Factor | Endpoint(s) | What it does |
-|---|---|---|
-| Fingerprint (TapSign) | `POST /tapsign/enroll`, `/tapsign/verify` | Centralized cosine-similarity match against an encrypted template |
-| Face | `POST /face/enroll`, `/face/verify` | Same pattern, separate modality, tighter threshold |
-| PIN | `POST /pin/set`, `/pin/verify` | Bcrypt-hashed, 5-attempt lockout with cooldown ("accountability") |
-| Phone/SIM | `POST /phone/verify` | Carrier lookup + recent-SIM-swap risk flag |
-| Device (challenge-response) | `POST /device/register`, `/challenge`, `/verify`, `GET /device/selftest` | **Real** Ed25519 sign/verify protocol — see below |
-| Composite | `POST /auth/member/authenticate`, `GET /auth/member/protocol-selftest` | Runs whichever factors are supplied and feeds the result into the eGov risk module |
-
-**Two authentication models, on purpose.** Factors 1–3 above use the
-same centralized-vector-matching approach as the original TapSign demo —
-easy to reason about and test, but not how production hardware-backed
-biometric auth actually works. The **device challenge-response protocol**
-(`app/services/device_auth_service.py`) is the realistic alternative:
-the device generates an Ed25519 keypair locally, the private key never
-leaves it, and the backend only ever verifies a signed, one-time,
-action-bound nonce — the same public, standards-based pattern behind
-FIDO2/WebAuthn/passkeys. `GET /device/selftest` runs this protocol
-end-to-end with a throwaway keypair and confirms both that a valid
-signature is accepted *and* that a tampered challenge is correctly
-rejected.
+Canonical package directory is `app/` (imports are `from app...`).
+`main.py` is the single application entrypoint.
 
 ## eGov Citizen Risk Assessment ML module
 
-Implements `Citizen_Risk_Assessment_ML_Module.pdf`: `POST
-/egov/risk-score` returns the exact response shape from the spec
-(`risk_score`, `risk_level`, `org_type`, `top_reasons`, `model_version`,
-`decision_source`), backed by a baseline **Logistic Regression** model
-(`app/services/citizen_risk_service.py`) with linear-coefficient-based
-explanations (the exact equivalent of SHAP's `LinearExplainer` for this
-model type — swap in `shap.TreeExplainer` if a candidate tree model
-replaces the baseline). Every prediction is stored **additively** in
-`CitizenRiskPrediction` with a full audit snapshot, and the module
-automatically falls back to a transparent rule-based score
-(`decision_source: "RULE_BASED_FALLBACK"`) whenever the model's
-confidence is too low — per the spec's safety requirement that it "never
-makes an unreviewed decision without a safety net."
+Standalone-style scoring engine inside this FastAPI app (egov-ml-engine),
+per `Citizen_Risk_Assessment_ML_Module`:
 
-The PIN/phone factors above feed directly into this model as behavioral
-signals (`pin_failed_attempts`, `phone_sim_swap_recent`) — this is how
-the new security factors "correspond to the eGov framework."
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `POST /internal/risk-score` | `X-Internal-Service-Key` | Spec sync interface for Java callers |
+| `POST /api/v1/egov/risk-score` | JWT | Compatibility wrapper for Swagger / app use |
+
+Every response includes `risk_score`, `risk_level`, `org_type`, `top_reasons`,
+`model_version`, and `decision_source` (`ML` | `RULE_BASED_FALLBACK` | `BOTH`).
+
+**Rollout modes** (env `CITIZEN_RISK_ROLLOUT`, default all `SHADOW`):
+
+- `DISABLED` — rules only
+- `SHADOW` — ML + rules computed; **rule score is returned** with `decision_source=BOTH`
+- `ML_ASSISTED` — ML returned when healthy and confident; otherwise rule fallback
+
+**Model:** org-segmented Logistic Regression (`BANK` / `POLICE` / `COURT` / `DEFAULT`)
+with coefficient-based explanations (LinearExplainer-equivalent). Holdout
+AUC-ROC / F1 / Brier metrics are attached as development metadata.
+
+**WARNING — synthetic training:** models are trained on deterministic synthetic
+data until real CitizenCreditScore / service / location / compliance extracts
+are wired. Responses set `development_only: true`. Do not enable automated
+decisioning on synthetic metrics alone.
+
+**Safety:** low-confidence and ML failures always fall back to rules; every
+fallback is logged. Predictions are stored **additively** in
+`citizen_risk_predictions` (never overwrites existing credit-score rows).
+Schema expansion runs via `app/db/migrate_citizen_risk.py` on startup.
+
+**Deferred:** Kafka consumer/producer and live Java microservice wiring.
+
+Example internal call:
+
+```powershell
+curl -X POST http://127.0.0.1:8000/internal/risk-score `
+  -H "Content-Type: application/json" `
+  -H "X-Internal-Service-Key: CHANGE_ME_INTERNAL_SERVICE_KEY" `
+  -d "{\"subject_ref\":\"c-1\",\"org_type\":\"BANK\",\"late_payments\":5,\"overdue_services\":3,\"compliance_flags\":1}"
+```
+
+Tests:
+
+```powershell
+pytest tests/test_citizen_risk.py -q
+```
+
+The PIN/phone factors feed this model as behavioral signals
+(`pin_failed_attempts`, `phone_sim_swap_recent`).
 
 ## TapSign ML risk monitoring (analytics only — never blocks)
 
