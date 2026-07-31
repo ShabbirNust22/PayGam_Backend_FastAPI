@@ -1,15 +1,18 @@
 """
 Org-segmented Logistic Regression registry for Citizen Risk Assessment.
 
-Training uses deterministic synthetic data (development-only). Swap
-`_make_synthetic_training_set` / load path for real CitizenCreditScore
-platform extracts when the Java data pipeline is wired.
+Loads versioned joblib artifacts when available. Synthetic train-on-boot is
+allowed only outside production and only when explicitly enabled.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 from dataclasses import dataclass
+from pathlib import Path
 
+import joblib
 import numpy as np
 from sklearn.calibration import calibration_curve
 from sklearn.linear_model import LogisticRegression
@@ -17,45 +20,15 @@ from sklearn.metrics import brier_score_loss, f1_score, roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
+from app.core.config import settings
 from app.schemas.citizen_risk import ModelMetricsOut, RiskReason
+from app.services.citizen_risk_data_synthetic import make_synthetic_training_set
 from app.services.citizen_risk_features import FEATURE_LABELS, FEATURE_NAMES, normalize_org_segment
 
+logger = logging.getLogger("citizen_risk.model")
+
 MODEL_FAMILY = "logistic_regression"
-MODEL_VERSION_PREFIX = "v1.0.0-synth"
-
-# Per-org weight emphasis so BANK / POLICE / COURT learn different patterns.
-_ORG_WEIGHTS = {
-    "BANK": np.array([0.40, 0.35, 0.05, 0.08, 0.30, 0.18, 0.40]),
-    "POLICE": np.array([0.15, 0.10, 0.12, 0.35, 0.45, 0.25, 0.30]),
-    "COURT": np.array([0.25, 0.20, 0.08, 0.15, 0.50, 0.22, 0.28]),
-    "DEFAULT": np.array([0.35, 0.30, 0.05, 0.10, 0.40, 0.20, 0.45]),
-}
-
-_ORG_SEEDS = {"BANK": 11, "POLICE": 22, "COURT": 33, "DEFAULT": 42}
-
-
-def _make_synthetic_training_set(org_segment: str, n: int = 2000) -> tuple[np.ndarray, np.ndarray]:
-    """
-    DEVELOPMENT ONLY — synthetic-but-plausible labeled rows.
-    Replace with a query against CitizenCreditScore / ServiceRequest /
-    Location / Compliance tables when platform data is available.
-    """
-    seed = _ORG_SEEDS.get(org_segment, 42)
-    weights = _ORG_WEIGHTS.get(org_segment, _ORG_WEIGHTS["DEFAULT"])
-    rng = np.random.default_rng(seed)
-    X = np.column_stack([
-        rng.poisson(1.2, n),
-        rng.poisson(0.8, n),
-        rng.poisson(4, n),
-        rng.poisson(2, n) + 1,
-        rng.poisson(0.5, n),
-        rng.poisson(0.3, n),
-        rng.integers(0, 2, n),
-    ]).astype(float)
-    logits = X @ weights - 2.2 + rng.normal(0, 0.5, n)
-    probs = 1 / (1 + np.exp(-logits))
-    y = (rng.random(n) < probs).astype(int)
-    return X, y
+SEGMENTS = ("BANK", "POLICE", "COURT", "DEFAULT")
 
 
 @dataclass
@@ -65,6 +38,7 @@ class SegmentModel:
     scaler: StandardScaler
     model: LogisticRegression
     metrics: ModelMetricsOut
+    source: str
 
     def predict(self, feature_vector: list[float]) -> tuple[float, float, list[RiskReason]]:
         x = np.array(feature_vector, dtype=float).reshape(1, -1)
@@ -86,10 +60,10 @@ class SegmentModel:
         return proba, confidence, reasons
 
 
-def _evaluate(model: LogisticRegression, scaler: StandardScaler, X: np.ndarray, y: np.ndarray) -> ModelMetricsOut:
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=7, stratify=y)
-    # Re-fit on train split for honest holdout metrics (caller already fitted on full set;
-    # we train a twin for evaluation only).
+def _evaluate(X: np.ndarray, y: np.ndarray) -> ModelMetricsOut:
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, random_state=7, stratify=y
+    )
     eval_scaler = StandardScaler().fit(X_train)
     X_train_s = eval_scaler.transform(X_train)
     X_test_s = eval_scaler.transform(X_test)
@@ -99,7 +73,6 @@ def _evaluate(model: LogisticRegression, scaler: StandardScaler, X: np.ndarray, 
     auc = float(roc_auc_score(y_test, proba)) if len(np.unique(y_test)) > 1 else None
     f1 = float(f1_score(y_test, preds, zero_division=0))
     brier = float(brier_score_loss(y_test, proba))
-    # Touch calibration_curve so calibration tooling is exercised in CI.
     if len(np.unique(y_test)) > 1:
         calibration_curve(y_test, proba, n_bins=5)
     return ModelMetricsOut(
@@ -110,43 +83,117 @@ def _evaluate(model: LogisticRegression, scaler: StandardScaler, X: np.ndarray, 
     )
 
 
-def _train_segment(org_segment: str) -> SegmentModel:
-    X, y = _make_synthetic_training_set(org_segment)
+def train_segment(org_segment: str) -> SegmentModel:
+    X, y = make_synthetic_training_set(org_segment)
     scaler = StandardScaler().fit(X)
-    X_scaled = scaler.transform(X)
-    model = LogisticRegression(max_iter=500, random_state=_ORG_SEEDS.get(org_segment, 42)).fit(X_scaled, y)
-    metrics = _evaluate(model, scaler, X, y)
-    version = f"{MODEL_VERSION_PREFIX}-{org_segment.lower()}-{MODEL_FAMILY}"
+    model = LogisticRegression(max_iter=500, random_state=42).fit(scaler.transform(X), y)
+    metrics = _evaluate(X, y)
+    version = f"v1.0.0-synth-{org_segment.lower()}-{MODEL_FAMILY}"
     return SegmentModel(
         org_segment=org_segment,
         version=version,
         scaler=scaler,
         model=model,
         metrics=metrics,
+        source="synthetic",
+    )
+
+
+def artifact_path(org_segment: str, model_dir: str | Path | None = None) -> Path:
+    root = Path(model_dir or settings.CITIZEN_RISK_MODEL_DIR)
+    return root / f"{org_segment.lower()}_{MODEL_FAMILY}.joblib"
+
+
+def save_segment(segment: SegmentModel, model_dir: str | Path | None = None) -> Path:
+    path = artifact_path(segment.org_segment, model_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(
+        {
+            "org_segment": segment.org_segment,
+            "version": segment.version,
+            "scaler": segment.scaler,
+            "model": segment.model,
+            "metrics": segment.metrics.model_dump(),
+            "source": segment.source,
+            "feature_names": FEATURE_NAMES,
+        },
+        path,
+    )
+    meta = path.with_suffix(".json")
+    meta.write_text(
+        json.dumps(
+            {
+                "org_segment": segment.org_segment,
+                "version": segment.version,
+                "metrics": segment.metrics.model_dump(),
+                "source": segment.source,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def load_segment(org_segment: str, model_dir: str | Path | None = None) -> SegmentModel | None:
+    path = artifact_path(org_segment, model_dir)
+    if not path.exists():
+        return None
+    payload = joblib.load(path)
+    metrics = ModelMetricsOut(**payload.get("metrics", {}))
+    return SegmentModel(
+        org_segment=payload["org_segment"],
+        version=payload["version"],
+        scaler=payload["scaler"],
+        model=payload["model"],
+        metrics=metrics,
+        source=payload.get("source", "artifact"),
     )
 
 
 class ModelRegistry:
-    """Loads one Logistic Regression per org segment at process start."""
-
     def __init__(self) -> None:
-        self._models: dict[str, SegmentModel] = {
-            segment: _train_segment(segment) for segment in ("BANK", "POLICE", "COURT", "DEFAULT")
-        }
-        self._force_failure = False  # test hook
+        self._models: dict[str, SegmentModel] = {}
+        self._force_failure = False
+        self._load_or_bootstrap()
+
+    def _load_or_bootstrap(self) -> None:
+        for segment in SEGMENTS:
+            loaded = load_segment(segment)
+            if loaded:
+                self._models[segment] = loaded
+                continue
+            if settings.is_production or not settings.CITIZEN_RISK_ALLOW_SYNTHETIC_TRAIN_ON_BOOT:
+                logger.warning(
+                    "citizen_risk_artifact_missing segment=%s — ML unavailable until artifacts are trained",
+                    segment,
+                )
+                continue
+            trained = train_segment(segment)
+            save_segment(trained)
+            self._models[segment] = trained
 
     def get(self, org_type: str) -> SegmentModel:
         if self._force_failure:
             raise RuntimeError("Forced model failure (test hook)")
         segment = normalize_org_segment(org_type)
-        return self._models[segment]
+        model = self._models.get(segment) or self._models.get("DEFAULT")
+        if model is None:
+            raise RuntimeError(f"No citizen-risk model artifact for segment {segment}")
+        return model
 
     def force_failure(self, enabled: bool = True) -> None:
         self._force_failure = enabled
 
+    def has_models(self) -> bool:
+        return bool(self._models)
 
-_REGISTRY = ModelRegistry()
+
+_REGISTRY: ModelRegistry | None = None
 
 
 def get_registry() -> ModelRegistry:
+    global _REGISTRY
+    if _REGISTRY is None:
+        _REGISTRY = ModelRegistry()
     return _REGISTRY

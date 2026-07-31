@@ -1,0 +1,76 @@
+PayGam Java eGov <-> Python FastAPI integration
+==============================================
+
+Ownership
+---------
+Java eGov (PG-DEVELOPERS-REPO-JAVA)
+  - BiometricDevice (HF7000 / scanner registry)
+  - BiometricTemplate (encrypted vendor templates, finger positions)
+  - BiometricLoginRequest handling and vendor SDK match
+
+Python PayGam FastAPI (this repo)
+  - Wallet / payments / TapSign demo vectors
+  - Device challenge-response (Ed25519 phone keys) — NOT HF7000 registry
+  - Citizen risk scoring: POST /internal/risk-score
+  - Partner event ingestion: POST /internal/partners/{partner}/events
+
+
+Recommended live biometric login + risk sequence
+------------------------------------------------
+1. Client -> Java: BiometricLoginRequest
+   { biometricData, deviceId, citizenId, biometricType }
+
+2. Java:
+   - ensure BiometricDevice is ACTIVE, PIN not locked
+   - load BiometricTemplate for citizenId + type
+   - run vendor SDK match
+
+3. On success, Java -> Python (service-to-service):
+
+   POST /internal/risk-score
+   Header: X-Internal-Service-Key: <shared secret>
+   Body:
+   {
+     "subject_ref": "<opaque mapped id, e.g. paygam_user_uuid or institutional ref>",
+     "org_type": "BANK",
+     "late_payments": 0,
+     "overdue_services": 0,
+     "service_requests_30d": 0,
+     "distinct_locations_30d": 1,
+     "compliance_flags": 0,
+     "pin_failed_attempts": 0,
+     "phone_sim_swap_recent": false
+   }
+
+4. Java returns login success plus optional risk_score / risk_level to client.
+
+
+subject_ref mapping
+-------------------
+Never send national ID into the ML audit table.
+Maintain a mapping:
+  Java citizenId / userId  <->  PayGam subject_ref (opaque)
+Prefer PayGam user UUID when the citizen already has a wallet account.
+
+
+Optional TapSign path
+---------------------
+If Java extracts a shared float feature vector (not HF_PRIVATE binary),
+it may call:
+  POST /api/v1/tapsign/verify
+with a JWT for the mapped PayGam user.
+Do NOT send ISO/ANSI/HF vendor template bytes to cosine_match — formats differ.
+
+
+Partner feeds
+-------------
+Banks/telcos/utilities POST events to:
+  POST /internal/partners/{partner_code}/events
+Then build+score with:
+  POST /internal/partners/features/build
+
+
+Auth
+----
+All /internal/** routes require X-Internal-Service-Key.
+Do not expose this key in mobile apps.

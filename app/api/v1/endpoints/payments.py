@@ -1,14 +1,16 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
+from app.core.config import settings
 from app.db.database import get_db
+from app.models.transaction import Transaction, TransactionStatus
 from app.models.user import User, Wallet
-from app.models.transaction import Transaction, TransactionStatus, TransactionType
 from app.schemas.transaction import PaymentRequest, TransactionOut
-from app.services import tapsign_service, risk_service, risk_monitoring_service
+from app.services import risk_monitoring_service, risk_service, tapsign_service
 
 router = APIRouter(prefix="/payments", tags=["Payments"])
 
@@ -26,16 +28,17 @@ def send_money(
     payload: PaymentRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
-    """
-    End-to-end payment flow:
-      1. Verify the TapSign fingerprint tap (liveness + template match).
-      2. Score the transaction for fraud risk.
-      3. Authorize / flag for review / block accordingly.
-      4. Move funds and record the transaction.
-    """
-    # --- Step 1: TapSign biometric authorization ---
-    template = db.query(User).filter(User.id == current_user.id).first().biometric_template
+    if settings.PAYMENTS_REQUIRE_EGOV_VERIFIED and not current_user.egov_verified:
+        raise HTTPException(status_code=403, detail="EGOV verification required before sending money")
+
+    if idempotency_key:
+        existing = db.query(Transaction).filter(Transaction.idempotency_key == idempotency_key).first()
+        if existing:
+            return existing
+
+    template = current_user.biometric_template
     if not template:
         raise HTTPException(status_code=400, detail="TapSign not enrolled for this account")
 
@@ -52,9 +55,6 @@ def send_money(
     else:
         tapsign_status = "match"
 
-    # Monitoring-only: record the approval outcome for the TapSign risk
-    # dashboard. This NEVER influences the decision above — it's a
-    # side-channel observation, per TapSign_ML.pdf's "monitoring only" rule.
     risk_monitoring_service.emit_event(
         db,
         event_type="approval_consumed" if tapsign_status == "match" else "approval_denied",
@@ -63,24 +63,22 @@ def send_money(
     )
 
     if tapsign_status != "match":
-        _record_failed_transaction(db, current_user.id, payload, tapsign_status)
-        raise HTTPException(status_code=403, detail=f"TapSign authorization failed: {tapsign_result.reason}")
+        _record_failed_transaction(db, current_user.id, payload, tapsign_status, idempotency_key)
+        raise HTTPException(status_code=403, detail="TapSign authorization failed")
 
-    # --- Step 2: receiver + balance checks ---
     receiver = db.query(User).filter(User.phone_number == payload.receiver_phone_number).first()
     if not receiver:
         raise HTTPException(status_code=404, detail="Receiver not found")
+    if receiver.id == current_user.id:
+        raise HTTPException(status_code=400, detail="Cannot send money to yourself")
 
-    sender_wallet = db.query(Wallet).filter(Wallet.user_id == current_user.id).first()
-    if sender_wallet.balance < payload.amount:
-        raise HTTPException(status_code=400, detail="Insufficient balance")
-
-    # --- Step 3: risk scoring ---
+    amount = Decimal(payload.amount)
+    since = datetime.now(timezone.utc) - timedelta(hours=1)
     recent_tx_count = (
         db.query(Transaction)
-        .filter(Transaction.sender_id == current_user.id)
+        .filter(Transaction.sender_id == current_user.id, Transaction.created_at >= since)
         .count()
-    )  # simplified: a real system would filter to the last 1h window
+    )
     is_new_receiver = (
         db.query(Transaction)
         .filter(Transaction.sender_id == current_user.id, Transaction.receiver_id == receiver.id)
@@ -88,20 +86,37 @@ def send_money(
         is None
     )
     risk_score = risk_service.score_transaction(
-        amount=payload.amount,
+        amount=float(amount),
         sender_recent_tx_count_1h=recent_tx_count,
         is_new_receiver=is_new_receiver,
     )
     decision = risk_service.decision_for_score(risk_score)
 
+    # Lock wallets in stable order to avoid deadlocks.
+    wallet_ids = sorted([current_user.id, receiver.id])
+    wallets = {
+        w.user_id: w
+        for w in db.query(Wallet)
+        .filter(Wallet.user_id.in_(wallet_ids))
+        .with_for_update()
+        .all()
+    }
+    sender_wallet = wallets.get(current_user.id)
+    receiver_wallet = wallets.get(receiver.id)
+    if not sender_wallet or not receiver_wallet:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+    if Decimal(sender_wallet.balance) < amount:
+        raise HTTPException(status_code=400, detail="Insufficient balance")
+
     tx = Transaction(
         sender_id=current_user.id,
         receiver_id=receiver.id,
         type=payload.type,
-        amount=payload.amount,
+        amount=amount,
         risk_score=risk_score,
         tapsign_verified=tapsign_status,
         status=TransactionStatus.PENDING,
+        idempotency_key=idempotency_key,
     )
 
     if decision == "blocked":
@@ -116,12 +131,12 @@ def send_money(
         db.add(tx)
         db.commit()
         db.refresh(tx)
-        return tx  # funds NOT moved yet — held pending manual/automated review
+        return tx
 
-    # --- Step 4: authorized — move funds ---
-    receiver_wallet = db.query(Wallet).filter(Wallet.user_id == receiver.id).first()
-    sender_wallet.balance -= payload.amount
-    receiver_wallet.balance += payload.amount
+    sender_wallet.balance = Decimal(sender_wallet.balance) - amount
+    receiver_wallet.balance = Decimal(receiver_wallet.balance) + amount
+    sender_wallet.updated_at = datetime.now(timezone.utc)
+    receiver_wallet.updated_at = datetime.now(timezone.utc)
 
     tx.status = TransactionStatus.COMPLETED
     tx.completed_at = datetime.now(timezone.utc)
@@ -131,15 +146,22 @@ def send_money(
     return tx
 
 
-def _record_failed_transaction(db: Session, sender_id: str, payload: PaymentRequest, tapsign_status: str):
+def _record_failed_transaction(
+    db: Session,
+    sender_id: str,
+    payload: PaymentRequest,
+    tapsign_status: str,
+    idempotency_key: str | None,
+):
     receiver = db.query(User).filter(User.phone_number == payload.receiver_phone_number).first()
     tx = Transaction(
         sender_id=sender_id,
         receiver_id=receiver.id if receiver else None,
         type=payload.type,
-        amount=payload.amount,
+        amount=Decimal(payload.amount),
         status=TransactionStatus.FAILED,
         tapsign_verified=tapsign_status,
+        idempotency_key=idempotency_key,
     )
     db.add(tx)
     db.commit()

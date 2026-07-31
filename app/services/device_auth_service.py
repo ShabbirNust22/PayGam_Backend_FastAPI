@@ -61,8 +61,8 @@ def verify_signature(public_key_pem: str, nonce: str, signature_b64: str) -> tup
         return True, None
     except InvalidSignature:
         return False, "Signature does not match — wrong key or tampered challenge."
-    except Exception as exc:  # malformed key/signature/base64, etc.
-        return False, f"Could not verify signature: {exc}"
+    except Exception:
+        return False, "Could not verify signature."
 
 
 def self_test() -> dict:

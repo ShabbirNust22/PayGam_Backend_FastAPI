@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
@@ -16,16 +16,12 @@ async def verify_identity(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Cross-checks the user's declared national ID / name / DOB against the
-    government EGOV registry. On success, marks the account as EGOV-verified
-    (required before higher transaction limits are unlocked).
-    """
-    result = await egov_service.call_egov_api(payload)
+    if payload.full_name.strip().lower() != current_user.full_name.strip().lower():
+        raise HTTPException(status_code=400, detail="Full name must match the authenticated account")
 
+    result = await egov_service.call_egov_api(payload)
     if result.verified:
         current_user.egov_verified = True
         current_user.national_id_number = payload.national_id_number
         db.commit()
-
     return result

@@ -75,6 +75,16 @@ def _try_ml(features: CitizenRiskFeatures) -> tuple[SegmentModel | None, float |
 
 def decide(features: CitizenRiskFeatures) -> ScoreBundle:
     rollout = _parse_rollout(features.org_type)
+    # Never silently train synthetic models for assisted decisions in production.
+    if settings.is_production and rollout == RolloutMode.ML_ASSISTED:
+        if not get_registry().has_models() or settings.CITIZEN_RISK_DEVELOPMENT_ONLY:
+            rollout = RolloutMode.SHADOW
+            logger.warning(
+                "citizen_risk_forced_shadow subject_ref=%s org_type=%s reason=no_prod_artifacts",
+                features.subject_ref,
+                features.org_type,
+            )
+
     rule_score, rule_reasons = rule_based_score(features)
     segment, ml_score, confidence, ml_reasons, ml_error = _try_ml(features)
     model_version = segment.version if segment else "rules-only"

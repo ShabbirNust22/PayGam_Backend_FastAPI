@@ -1,183 +1,79 @@
-# PayGam Backend — FastAPI (TapSign + EGOV)
+# PayGam Backend — FastAPI (TapSign + EGOV) — Production-oriented V1
 
-Backend API for **PayGam** (paygamglobal.com), an e-wallet payment platform.
-This implements the payment-processing backend described in the
-ML-TapSign-EGOV progress report, with:
+Backend API for **PayGam** (paygamglobal.com): e-wallet payments, TapSign,
+EGOV KYC, and Citizen Risk Assessment ML on **PostgreSQL**.
 
-- **JWT-based auth** (register / login) and a wallet per user
-- **TapSign** — fingerprint biometric authorization (enrol + verify), gating
-  every outbound payment
-- **EGOV** — national ID verification (KYC) required to unlock full account
-  features
-- **Risk scoring** — every payment is screened before funds move
-  (authorized / held for review / blocked)
-
-## Project layout
-
-```
-paygam_backend/
-├── main.py                      # FastAPI app entrypoint
-├── requirements.txt
-└── app/
-    ├── core/
-    │   ├── config.py             # settings (thresholds, secrets, DB url)
-    │   └── security.py           # JWT, password hashing, template encryption
-    ├── db/
-    │   └── database.py           # SQLAlchemy engine/session
-    ├── models/                   # SQLAlchemy ORM: User, Wallet,
-    │   │                         # BiometricTemplate, FaceTemplate,
-    │   │                         # DeviceKey, AuthChallenge, Transaction,
-    │   │                         # CitizenRiskPrediction, RiskEvent, RiskAlert
-    │   ├── user.py
-    │   ├── transaction.py
-    │   ├── citizen_risk.py
-    │   └── risk_monitoring.py
-    ├── schemas/                  # Pydantic request/response models
-    │   ├── user.py
-    │   ├── tapsign.py
-    │   ├── face.py
-    │   ├── pin.py
-    │   ├── phone.py
-    │   ├── device.py
-    │   ├── egov.py
-    │   ├── citizen_risk.py
-    │   ├── risk_monitoring.py
-    │   ├── member_auth.py
-    │   └── transaction.py
-    ├── services/                 # business logic, framework-agnostic
-    │   ├── biometric_matching.py # shared cosine-similarity template matching
-    │   ├── tapsign_service.py    # fingerprint matching (centralized-vector demo)
-    │   ├── face_service.py       # facial identity matching (same pattern)
-    │   ├── device_auth_service.py# REAL challenge-response protocol (Ed25519)
-    │   ├── pin_service.py        # PIN hashing, attempts, lockout
-    │   ├── phone_service.py      # phone/SIM authenticity checks
-    │   ├── egov_service.py       # government identity-verification client
-    │   ├── citizen_risk_service.py   # eGov Citizen Risk Assessment ML module
-    │   ├── risk_monitoring_service.py# TapSign risk monitoring (analytics-only)
-    │   └── risk_service.py       # payment transaction fraud/risk scoring
-    └── api/
-        ├── deps.py                # get_current_user() auth dependency
-        └── v1/
-            ├── api.py             # router aggregator
-            └── endpoints/
-                ├── auth.py
-                ├── tapsign.py
-                ├── face.py
-                ├── pin.py
-                ├── phone.py
-                ├── device.py
-                ├── egov.py
-                ├── egov_risk.py
-                ├── payments.py
-                └── risk_insights.py
-```
-
-## Run it (Windows)
+## Quick start (Windows / local SQLite)
 
 ```powershell
 python -m venv venv
 .\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+copy .env.example .env
+# Optional: set TEMPLATE_ENCRYPTION_KEY for durable biometrics
 uvicorn main:app --reload
 ```
 
-Swagger UI: **http://127.0.0.1:8000/docs**
-(SQLite database `paygam.db` is created automatically on first run — swap
-`DATABASE_URL` in `app/core/config.py` or `.env` for Postgres/MySQL in production.)
+Swagger: http://127.0.0.1:8000/docs (disabled automatically when `ENVIRONMENT=production`)
 
-Canonical package directory is `app/` (imports are `from app...`).
-`main.py` is the single application entrypoint.
+## Postgres via Docker Compose
 
-## eGov Citizen Risk Assessment ML module
+```powershell
+# Generate a Fernet key once:
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 
-Standalone-style scoring engine inside this FastAPI app (egov-ml-engine),
-per `Citizen_Risk_Assessment_ML_Module`:
+# Put it in the environment or a .env next to compose, then:
+docker compose up --build
+```
+
+Entrypoint waits for Postgres, runs `alembic upgrade head`, then starts uvicorn.
+
+Production checklist (fail-closed):
+- `ENVIRONMENT=production`
+- Strong `SECRET_KEY`, `INTERNAL_SERVICE_KEY`, `TEMPLATE_ENCRYPTION_KEY`
+- `DATABASE_URL=postgresql+psycopg://...`
+- `EGOV_USE_MOCK=false`, `TELCO_USE_MOCK=false`, real API keys
+- `CITIZEN_RISK_ALLOW_SYNTHETIC_TRAIN_ON_BOOT=false`
+- Explicit `ALLOWED_ORIGINS` (no `*`)
+
+## Architecture split with Java eGov
+
+See [docs/JAVA_INTEGRATION.txt](docs/JAVA_INTEGRATION.txt):
+
+- **Java** owns HF7000 `BiometricDevice` / `BiometricTemplate` / login DTO
+- **This service** owns wallet, payments, citizen risk, partner feeds
+
+## Key endpoints
 
 | Endpoint | Auth | Purpose |
 |---|---|---|
-| `POST /internal/risk-score` | `X-Internal-Service-Key` | Spec sync interface for Java callers |
-| `POST /api/v1/egov/risk-score` | JWT | Compatibility wrapper for Swagger / app use |
+| `POST /api/v1/auth/register\|login` | — | User + JWT |
+| `POST /api/v1/payments/send` | JWT + optional `Idempotency-Key` | TapSign-gated transfer |
+| `POST /api/v1/tapsign/*`, `/face/*`, `/pin/*`, `/device/*` | JWT | Auth factors |
+| `POST /api/v1/egov/verify` | JWT | KYC (mock outside prod) |
+| `POST /internal/risk-score` | `X-Internal-Service-Key` | Citizen risk (spec) |
+| `POST /internal/partners/{code}/events` | service key | Partner feature feeds |
+| `GET /health` | — | Includes DB check |
 
-Every response includes `risk_score`, `risk_level`, `org_type`, `top_reasons`,
-`model_version`, and `decision_source` (`ML` | `RULE_BASED_FALLBACK` | `BOTH`).
+## Citizen risk
 
-**Rollout modes** (env `CITIZEN_RISK_ROLLOUT`, default all `SHADOW`):
+- Org-segmented Logistic Regression artifacts under `model_artifacts/citizen_risk`
+- Train offline: `python scripts/train_citizen_risk.py`
+- Default rollout: **SHADOW** (rules authoritative)
+- Production never silent-trains synthetic models for `ML_ASSISTED`
 
-- `DISABLED` — rules only
-- `SHADOW` — ML + rules computed; **rule score is returned** with `decision_source=BOTH`
-- `ML_ASSISTED` — ML returned when healthy and confident; otherwise rule fallback
-
-**Model:** org-segmented Logistic Regression (`BANK` / `POLICE` / `COURT` / `DEFAULT`)
-with coefficient-based explanations (LinearExplainer-equivalent). Holdout
-AUC-ROC / F1 / Brier metrics are attached as development metadata.
-
-**WARNING — synthetic training:** models are trained on deterministic synthetic
-data until real CitizenCreditScore / service / location / compliance extracts
-are wired. Responses set `development_only: true`. Do not enable automated
-decisioning on synthetic metrics alone.
-
-**Safety:** low-confidence and ML failures always fall back to rules; every
-fallback is logged. Predictions are stored **additively** in
-`citizen_risk_predictions` (never overwrites existing credit-score rows).
-Schema expansion runs via `app/db/migrate_citizen_risk.py` on startup.
-
-**Deferred:** Kafka consumer/producer and live Java microservice wiring.
-
-Example internal call:
+## Migrations
 
 ```powershell
-curl -X POST http://127.0.0.1:8000/internal/risk-score `
-  -H "Content-Type: application/json" `
-  -H "X-Internal-Service-Key: CHANGE_ME_INTERNAL_SERVICE_KEY" `
-  -d "{\"subject_ref\":\"c-1\",\"org_type\":\"BANK\",\"late_payments\":5,\"overdue_services\":3,\"compliance_flags\":1}"
+alembic upgrade head
 ```
 
-Tests:
+Dev/test may still bootstrap via `create_all` when `ENVIRONMENT!=production`.
+
+## Tests
 
 ```powershell
-pytest tests/test_citizen_risk.py -q
+pytest -q
 ```
 
-The PIN/phone factors feed this model as behavioral signals
-(`pin_failed_attempts`, `phone_sim_swap_recent`).
-
-## TapSign ML risk monitoring (analytics only — never blocks)
-
-Implements the monitoring layer from `TapSign_ML.pdf`, under `/risk-insights`:
-event ingestion, per-device aggregations, and rule-based monitors
-(`unusual_device`, `excessive_attempts`, and the manifest's key
-`tapsign_bypass` detector). Every function in
-`app/services/risk_monitoring_service.py` either appends an event,
-computes a read-only aggregate, or raises an advisory alert — **none of
-them can block, deny, or modify trust/wallet/approval state**, per the
-manifest's one overriding rule. This is deliberately a separate module
-from `risk_service.py` (which *does* block payments) — monitoring and
-enforcement are kept apart on purpose.
-
-
-
-Two integration points are implemented as clearly-labeled stubs with the
-real request/response contract already in place, ready to be pointed at the
-live systems:
-
-- **`app/services/tapsign_service.py`** — `cosine_match()` currently
-  compares vectors you send it. When the CNN (`Conv2D → Conv2D → Dense →
-  sigmoid`, per the progress report) is deployed as an inference service,
-  point feature extraction at it; the matching/threshold logic here is
-  already production-shaped (encrypted-at-rest templates, configurable
-  threshold, liveness gate).
-- **`app/services/egov_service.py`** — `call_egov_api()` has the real
-  government API call written and commented out, plus a mock fallback used
-  until EGOV credentials/endpoint are provisioned. Uncomment the `httpx`
-  block and set `EGOV_API_BASE_URL` / `EGOV_API_KEY` in `app/core/config.py`
-  to go live.
-
-## Security notes
-
-- Fingerprint templates are stored **encrypted at rest**
-  (`app/core/security.py::encrypt_template`), never as raw images.
-- Passwords are hashed with bcrypt, never stored in plaintext.
-- JWTs expire after `ACCESS_TOKEN_EXPIRE_MINUTES` (default 30).
-- `SECRET_KEY`, `EGOV_API_KEY`, and the template-encryption key must come
-  from a secrets manager in production — the values in `config.py` are
-  placeholders for local development only.
+Uses in-memory SQLite; set `ALLOWED_HOSTS` to include `testserver` (default).

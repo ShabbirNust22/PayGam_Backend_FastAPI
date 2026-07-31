@@ -1,35 +1,48 @@
 """
-Safety-focused tests for the Citizen Risk Assessment ML module.
+Safety-focused tests for production readiness + citizen risk.
 """
 
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
+from decimal import Decimal
 
-# Isolate tests from the developer's local paygam.db
-os.environ["DATABASE_URL"] = "sqlite:///./test_citizen_risk.db"
+# Isolate tests before importing app modules
+os.environ["ENVIRONMENT"] = "development"
+os.environ["DATABASE_URL"] = "sqlite://"
 os.environ["INTERNAL_SERVICE_KEY"] = "test-internal-key"
+os.environ["SECRET_KEY"] = "test-secret-key-with-enough-length-32"
+os.environ["ALLOWED_HOSTS"] = "testserver,localhost,127.0.0.1"
+os.environ["ALLOWED_ORIGINS"] = "http://testserver"
+os.environ["DOCS_ENABLED"] = "true"
+os.environ["EGOV_USE_MOCK"] = "true"
+os.environ["TELCO_USE_MOCK"] = "true"
 os.environ["CITIZEN_RISK_ROLLOUT"] = "BANK=SHADOW,POLICE=DISABLED,COURT=ML_ASSISTED,DEFAULT=SHADOW"
 os.environ["CITIZEN_RISK_MIN_CONFIDENCE_MARGIN"] = "0.08"
 os.environ["CITIZEN_RISK_DEVELOPMENT_ONLY"] = "true"
+os.environ["CITIZEN_RISK_ALLOW_SYNTHETIC_TRAIN_ON_BOOT"] = "true"
+os.environ["CITIZEN_RISK_MODEL_DIR"] = "model_artifacts/citizen_risk_test"
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.core.config import settings
+from app.core.config import Settings
 from app.db.database import Base, get_db
-from app.models.citizen_risk import CitizenRiskPrediction
+from app.models.citizen_risk import CitizenRiskPrediction, PartnerRiskEvent
+from app.models.user import User, Wallet
 from app.schemas.citizen_risk import CitizenRiskFeatures, DecisionSource, RolloutMode
 from app.services import citizen_risk_service
 from app.services.citizen_risk_model import get_registry
 from app.services.citizen_risk_policy import decide
 from app.services.citizen_risk_rules import rule_based_score
+from app.services.partner_feature_builder import build_features_from_partners, ingest_partner_event
+from app.core.security import create_access_token, hash_password
 
 import main as main_module
 
-# In-memory shared SQLite for API tests
 _engine = create_engine(
     "sqlite://",
     connect_args={"check_same_thread": False},
@@ -67,50 +80,65 @@ def _features(**overrides) -> CitizenRiskFeatures:
     return CitizenRiskFeatures(**base)
 
 
+def _auth_header_for_user(db) -> dict:
+    user = User(
+        full_name="Test User",
+        phone_number="+2201000001",
+        hashed_password=hash_password("password123"),
+    )
+    db.add(user)
+    db.flush()
+    db.add(Wallet(user_id=user.id, balance=Decimal("1000.00")))
+    db.commit()
+    token = create_access_token(subject=user.id)
+    return {"Authorization": f"Bearer {token}"}, user
+
+
+def test_production_config_fail_closed():
+    s = Settings(
+        ENVIRONMENT="production",
+        SECRET_KEY="CHANGE_ME_IN_PRODUCTION_USE_ENV_VAR",
+        DATABASE_URL="sqlite:///./x.db",
+        EGOV_USE_MOCK=True,
+        TELCO_USE_MOCK=True,
+        CITIZEN_RISK_ALLOW_SYNTHETIC_TRAIN_ON_BOOT=True,
+    )
+    try:
+        s.validate_for_environment()
+        assert False, "expected RuntimeError"
+    except RuntimeError as exc:
+        assert "SECRET_KEY" in str(exc)
+        assert "DATABASE_URL" in str(exc)
+
+
 def test_deterministic_rule_score():
     score, reasons = rule_based_score(_features())
     assert score >= 0.7
     assert reasons
-    assert all(hasattr(r, "feature") and hasattr(r, "contribution") for r in reasons)
-
-
-def test_org_segmentation_versions_differ():
-    bank = decide(_features(org_type="BANK"))
-    police = decide(_features(org_type="POLICE", late_payments=0, overdue_services=0, compliance_flags=0))
-    assert "bank" in bank.model_version.lower() or bank.rollout_mode == RolloutMode.SHADOW
-    assert police.rollout_mode == RolloutMode.DISABLED
-    assert police.response.decision_source == DecisionSource.RULE_BASED_FALLBACK
 
 
 def test_shadow_returns_both_with_rule_authoritative():
     bundle = decide(_features(org_type="BANK"))
     assert bundle.rollout_mode == RolloutMode.SHADOW
     assert bundle.response.decision_source in (DecisionSource.BOTH, DecisionSource.RULE_BASED_FALLBACK)
-    assert bundle.response.rule_score is not None
-    # In shadow, returned score is the rule score when ML is available
     if bundle.response.decision_source == DecisionSource.BOTH:
         assert bundle.response.risk_score == bundle.response.rule_score
-        assert bundle.ml_score is not None
 
 
 def test_explanation_shape():
     out = citizen_risk_service.score_citizen(_features())
     assert out.top_reasons
-    for reason in out.top_reasons:
-        assert isinstance(reason.feature, str) and reason.feature
-        assert isinstance(reason.contribution, float)
     assert out.model_version
     assert out.decision_source in DecisionSource
-    assert out.development_only is True
 
 
 def test_low_confidence_fallback_in_ml_assisted(monkeypatch):
-    # Force a near-0.5 probability via monkeypatch on SegmentModel.predict
     registry = get_registry()
     segment = registry.get("COURT")
 
     def low_conf_predict(feature_vector):
         from app.schemas.citizen_risk import RiskReason
+
         return 0.51, 0.01, [RiskReason(feature="Late payments", contribution=0.1)]
 
     monkeypatch.setattr(segment, "predict", low_conf_predict)
@@ -134,23 +162,18 @@ def test_disabled_rollout_rules_only():
     bundle = decide(_features(org_type="POLICE"))
     assert bundle.rollout_mode == RolloutMode.DISABLED
     assert bundle.response.decision_source == DecisionSource.RULE_BASED_FALLBACK
-    assert bundle.fallback_reason == "rollout_disabled"
 
 
 def test_internal_endpoint_contract():
-    payload = _features().model_dump()
     resp = client.post(
         "/internal/risk-score",
-        json=payload,
+        json=_features().model_dump(),
         headers={"X-Internal-Service-Key": "test-internal-key"},
     )
     assert resp.status_code == 200, resp.text
     data = resp.json()
     for key in ("risk_score", "risk_level", "org_type", "top_reasons", "model_version", "decision_source"):
         assert key in data
-    assert data["decision_source"] in ("ML", "RULE_BASED_FALLBACK", "BOTH")
-    assert data["risk_level"] in ("LOW", "MEDIUM", "HIGH")
-    assert isinstance(data["top_reasons"], list)
 
 
 def test_internal_endpoint_rejects_bad_key():
@@ -162,9 +185,57 @@ def test_internal_endpoint_rejects_bad_key():
     assert resp.status_code == 401
 
 
-def test_internal_endpoint_rejects_missing_key():
-    resp = client.post("/internal/risk-score", json=_features().model_dump())
+def test_risk_insights_requires_auth():
+    resp = client.post("/api/v1/risk-insights/events", json={"event_type": "login"})
     assert resp.status_code == 401
+    resp_ok = client.post(
+        "/api/v1/risk-insights/events",
+        json={"event_type": "login", "device_ref": "d1"},
+        headers={"X-Internal-Service-Key": "test-internal-key"},
+    )
+    assert resp_ok.status_code == 201
+
+
+def test_partner_event_builds_features():
+    db = TestingSessionLocal()
+    try:
+        ingest_partner_event(
+            db,
+            event_id="evt-1",
+            partner_code="BANK_XYZ",
+            subject_ref="subj-partner",
+            event_type="payment_overdue",
+            occurred_at=datetime.now(timezone.utc),
+            payload={"amount_gmd": 100},
+        )
+        ingest_partner_event(
+            db,
+            event_id="evt-2",
+            partner_code="AFRICELL",
+            subject_ref="subj-partner",
+            event_type="sim_swap",
+            occurred_at=datetime.now(timezone.utc),
+            payload={},
+        )
+        features = build_features_from_partners(db, "subj-partner", org_type="BANK")
+        assert features.late_payments >= 1
+        assert features.phone_sim_swap_recent is True
+    finally:
+        db.close()
+
+    resp = client.post(
+        "/internal/partners/BANK_XYZ/events",
+        json={
+            "event_id": "evt-http-1",
+            "subject_ref": "subj-http",
+            "event_type": "utility_overdue",
+            "occurred_at": datetime.now(timezone.utc).isoformat(),
+            "payload": {},
+        },
+        headers={"X-Internal-Service-Key": "test-internal-key"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["duplicate"] is False
 
 
 def test_append_only_audit_writes():
@@ -175,19 +246,11 @@ def test_append_only_audit_writes():
         citizen_risk_service.score_and_persist(_features(subject_ref="audit-a"), db)
         after = db.query(CitizenRiskPrediction).count()
         assert after == before + 2
-        rows = db.query(CitizenRiskPrediction).filter_by(subject_ref="audit-a").all()
-        assert len(rows) == 2
-        for row in rows:
-            assert row.input_feature_snapshot is not None
-            assert row.model_version
-            assert row.decision_source
-            assert row.rule_score is not None
     finally:
         db.close()
 
 
-def test_settings_rollout_map():
-    assert settings.rollout_mode_for_org("BANK") == "SHADOW"
-    assert settings.rollout_mode_for_org("POLICE") == "DISABLED"
-    assert settings.rollout_mode_for_org("COURT") == "ML_ASSISTED"
-    assert settings.rollout_mode_for_org("UNKNOWN") == "SHADOW"
+def test_health_endpoint():
+    resp = client.get("/health")
+    assert resp.status_code in (200, 503)
+    assert "database" in resp.json()

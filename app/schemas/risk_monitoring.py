@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class RiskEventIn(BaseModel):
@@ -6,13 +6,13 @@ class RiskEventIn(BaseModel):
     device_ref/subject_ref are opaque references only, never PII."""
     device_ref: str | None = None
     subject_ref: str | None = None
-    event_type: str  # login | approval_requested | approval_consumed | approval_denied
-                      # | recovery_attempt | identity_verify_attempt | device_bind
-                      # | device_unbind | tapsign_enable | tapsign_disable | sensitive_operation
+    event_type: str
     metadata: dict = {}
 
 
 class RiskAlertOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
     monitor: str
     subject_ref: str | None
@@ -21,9 +21,6 @@ class RiskAlertOut(BaseModel):
     message: str
     details: dict | None
     acknowledged: bool
-
-    class Config:
-        from_attributes = True
 
 
 class DeviceAggregationOut(BaseModel):

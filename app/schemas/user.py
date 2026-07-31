@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 
 class UserRegister(BaseModel):
@@ -14,15 +14,14 @@ class UserLogin(BaseModel):
 
 
 class UserOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
     full_name: str
     phone_number: str
     email: EmailStr | None
     egov_verified: bool
     tapsign_enrolled: bool
-
-    class Config:
-        from_attributes = True
 
 
 class Token(BaseModel):

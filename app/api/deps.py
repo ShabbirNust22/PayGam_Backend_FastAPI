@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+import secrets
+
 from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
@@ -8,6 +12,7 @@ from app.db.database import get_db
 from app.models.user import User
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
+oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=False)
 
 
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
@@ -29,14 +34,31 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
 def require_internal_service_key(
     x_internal_service_key: str | None = Header(default=None, alias="X-Internal-Service-Key"),
 ) -> None:
-    """Service-to-service auth for POST /internal/risk-score."""
+    """Service-to-service auth for internal endpoints."""
     expected = settings.INTERNAL_SERVICE_KEY
-    if not expected or expected == "CHANGE_ME_INTERNAL_SERVICE_KEY":
-        # Still require a matching key even with the placeholder so local demos
-        # exercise the auth path; production must override via env.
-        pass
-    if not x_internal_service_key or x_internal_service_key != expected:
+    if settings.is_production and (
+        not expected or expected in {"CHANGE_ME", "CHANGE_ME_INTERNAL_SERVICE_KEY"}
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Internal service authentication is misconfigured",
+        )
+    if not x_internal_service_key or not secrets.compare_digest(x_internal_service_key, expected):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing X-Internal-Service-Key",
         )
+
+
+def require_user_or_internal(
+    token: str | None = Depends(oauth2_scheme_optional),
+    x_internal_service_key: str | None = Header(default=None, alias="X-Internal-Service-Key"),
+    db: Session = Depends(get_db),
+) -> User | None:
+    """Allow either a valid JWT user or a valid internal service key."""
+    if x_internal_service_key:
+        require_internal_service_key(x_internal_service_key)
+        return None
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
+    return get_current_user(token, db)
